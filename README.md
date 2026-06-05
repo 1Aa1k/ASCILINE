@@ -6,7 +6,7 @@
 | :--- | :--- |
 | <img src="https://github.com/user-attachments/assets/cc38d219-b4d2-4873-82dc-2abb179b5665" width="400" alt="Original Animation" /> | **Original Source**<br>Standard MP4 video file. |
 | <img src="https://github.com/user-attachments/assets/6bd7f5c0-81de-49fe-ba0d-9a8872ec8ae3" width="400" alt="ASCII Mode" /> | **ASCII Mode**<br>Showcases rendered using Mode 3 (32K Colors) from a 30 FPS source video. The engine naturally synchronizes up to 60+ FPS depending on the source material. |
-| <img src="https://github.com/user-attachments/assets/0d6e9d4c-662c-4e38-b451-70d9b142bc1d" width="400" alt="Pixel Mode" /> | **PIXEL Mode**<br>Showcases rendered using Mode 3 (32K Colors) combined with `--pixel`. Replaces characters with colored blocks for ultra-high performance. **At higher grid resolutions, visual fidelity rivals or exceeds standard 240p/360p video streams.** |
+| <img src="https://github.com/user-attachments/assets/0d6e9d4c-662c-4e38-b451-70d9b142bc1d" width="400" alt="Pixel Mode" /> | **PIXEL Mode**<br>Showcases rendered using Mode 3 (32K Colors) combined with `--pixel`. Replaces characters with colored blocks for ultra-high performance. **At higher grid resolutions, The visual quality approaches standard 360p video streaming.** |
 
 ## 🎯 Strategic Vision & Core Capabilities
 
@@ -49,21 +49,21 @@ pip install fastapi uvicorn opencv-python numpy websockets
 
 **Single video:**
 ```bash
-python stream_server.py video.mp4
+python stream_server.py video.mp4 --cols 240
 ```
 
 **Folder mode — drop your videos into `videos/` and run:**
 ```bash
-python stream_server.py --folder videos
-python stream_server.py --folder videos --loop          # infinite loop
-python stream_server.py --folder videos --mode 5 --vol 2  # all videos same settings
+python stream_server.py --folder videos --cols 200
+python stream_server.py --folder videos --cols 230 --loop          # infinite loop
+python stream_server.py --folder videos --mode 5 --pixel --cols 320 --vol 2  # all videos same settings
 ```
 Videos play in **filesystem order** (top to bottom as they appear in the folder, not alphabetically). Just add/remove files from the `videos/` folder to control the queue.
 
 **JSON Playlist — full control per video:**
 ```bash
-python stream_server.py --playlist playlist.json
-python stream_server.py --playlist playlist.json --loop
+python stream_server.py --playlist playlist.json --cols 220
+python stream_server.py --playlist playlist.json --cols 220 --loop
 ```
 Use `playlist.json` when you need different `--mode` or `--vol` settings for each video.
 
@@ -72,7 +72,7 @@ Open `http://localhost:8000` in your browser.
 ### 4. Run directly in Terminal (Standalone)
 If you prefer to bypass the web interface, you can render the video directly inside an ANSI-supported terminal (zero-flicker, true color):
 ```bash
-python ascii_video_player2.py video.mp4 --quality 0
+python ascii_video_player2.py video.mp4 --cols 220 --quality 0
 ```
 
 ## 🎨 Customization
@@ -120,8 +120,8 @@ When set to `0`, the audio engine (FFmpeg) **never runs**, saving CPU and bandwi
 | `5`     | 2.0×             | Double volume |
 
 ```bash
-python stream_server.py video.mp4 --vol 0   # Silent
-python stream_server.py video.mp4 --vol 3   # Loud
+python stream_server.py video.mp4 --pixel --cols 330 --vol 0   # Silent
+python stream_server.py video.mp4 --cols 220 --vol 3   # Loud
 ```
 
 ### Playlist Format (`playlist.json`)
