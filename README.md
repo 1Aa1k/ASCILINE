@@ -151,7 +151,7 @@ Each entry can override the global `--mode`, `--pixel`, `--vol`, and `--cols` de
 [
     { "video": "intro.mp4",  "mode": 1, "vol": 1 },
     { "video": "main.mp4",   "mode": 5, "pixel": true, "vol": 3, "cols": 520 },
-    { "video": "outro.mp4",  "mode": 3, "vol": 2, "cols": 200 }
+    { "video": "outro.mp4",  "mode": 3, "vol": 2, "cols": 240 }
 ]
 ```
 Video paths are resolved automatically — the engine checks the project root and the `videos/` subfolder, so you can write just the filename.
