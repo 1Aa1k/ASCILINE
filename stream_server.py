@@ -25,6 +25,7 @@ from websockets.exceptions import ConnectionClosed
 # Import the existing engine (ascii_video_player2.py)
 from ascii_video_player2 import VideoDecoder, AsciiMapper
 from codec import encode_frame
+import ytdl
 
 app = FastAPI()
 
@@ -64,11 +65,15 @@ def get_html_content():
 def resolve_video_path(video: str) -> str:
     """
     Resolves a video path by checking multiple locations in order:
+      0. If it's a URL (YouTube, etc.) -> download via yt-dlp and use that file
       1. As-is (absolute or relative to CWD)
       2. Inside the project root (BASE_DIR)
       3. Inside BASE_DIR/videos/ subfolder
     Returns the first path that exists, or the original string if none found.
     """
+    if ytdl.is_url(video):
+        return ytdl.download(video, cache_dir=os.path.join(BASE_DIR, "videos"))
+
     candidates = [
         video,
         os.path.join(BASE_DIR, video),
