@@ -8,6 +8,7 @@ videos/ by video id so re-runs are instant.
 """
 import os
 import sys
+import json
 import subprocess
 
 _URL_HINTS = ("http://", "https://", "youtube.com", "youtu.be")
@@ -16,6 +17,38 @@ _URL_HINTS = ("http://", "https://", "youtube.com", "youtu.be")
 def is_url(s: str) -> bool:
     s = s.lower()
     return s.startswith(("http://", "https://")) or "youtube.com" in s or "youtu.be" in s
+
+
+def _entry_url(entry: dict) -> str | None:
+    """Best-effort downloadable URL for a single flat-playlist entry."""
+    url = entry.get("url") or entry.get("webpage_url")
+    if url and "/" in url:          # already a full URL
+        return url
+    vid = entry.get("id") or url    # bare video id (common for YouTube)
+    if vid:
+        return f"https://www.youtube.com/watch?v={vid}"
+    return None
+
+
+def expand_playlist(url: str) -> list[str]:
+    """
+    Expand a playlist/channel URL into a list of individual video URLs.
+
+    Uses `--flat-playlist` so it only reads the index (no per-video download).
+    Returns ``[url]`` unchanged for a single video, or if expansion fails for
+    any reason, so the caller can still attempt a normal single download.
+    """
+    res = _ytdlp("--flat-playlist", "-J", url)
+    if res.returncode != 0 or not res.stdout.strip():
+        return [url]
+    try:
+        info = json.loads(res.stdout)
+    except json.JSONDecodeError:
+        return [url]
+    if info.get("_type") != "playlist":
+        return [url]
+    urls = [u for u in (_entry_url(e) for e in info.get("entries") or []) if u]
+    return urls or [url]
 
 
 def _ytdlp(*args: str) -> subprocess.CompletedProcess:
