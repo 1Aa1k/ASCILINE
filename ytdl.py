@@ -25,6 +25,7 @@ import os
 import sys
 import json
 import shutil
+import importlib.util
 import subprocess
 
 _URL_HINTS = ("http://", "https://", "youtube.com", "youtu.be")
@@ -32,6 +33,11 @@ _URL_HINTS = ("http://", "https://", "youtube.com", "youtu.be")
 # What the engine can open without surprises.
 _OK_VCODEC = "h264"
 _OK_ACODEC = "aac"
+
+# Subprocess guards so a stuck source can never hang the server.
+_DL_TIMEOUT = 900      # yt-dlp download of a <=480p clip
+_PROBE_TIMEOUT = 60    # ffprobe / metadata reads
+_ENCODE_TIMEOUT = 1800  # ffmpeg re-encode of a long video
 
 
 def is_url(s: str) -> bool:
@@ -58,7 +64,8 @@ def expand_playlist(url: str) -> list[str]:
     Returns ``[url]`` unchanged for a single video, or if expansion fails for
     any reason, so the caller can still attempt a normal single download.
     """
-    res = _ytdlp("--flat-playlist", "-J", url)
+    _require_ytdlp()
+    res = _ytdlp("--flat-playlist", "-J", url, timeout=_PROBE_TIMEOUT)
     if res.returncode != 0 or not res.stdout.strip():
         return [url]
     try:
@@ -71,22 +78,46 @@ def expand_playlist(url: str) -> list[str]:
     return urls or [url]
 
 
-def _ytdlp(*args: str) -> subprocess.CompletedProcess:
+def _require_ytdlp() -> None:
+    """Fail early with an actionable message instead of a cryptic import error."""
+    if importlib.util.find_spec("yt_dlp") is None:
+        raise RuntimeError("yt-dlp is not installed. Install it with: pip install yt-dlp")
+
+
+def _ytdlp(*args: str, timeout: int = _DL_TIMEOUT) -> subprocess.CompletedProcess:
     # Use the running interpreter's yt_dlp so it always matches the venv.
-    return subprocess.run([sys.executable, "-m", "yt_dlp", *args],
-                          capture_output=True, text=True)
+    try:
+        return subprocess.run([sys.executable, "-m", "yt_dlp", *args],
+                              capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"yt-dlp timed out after {timeout}s")
+
+
+def _probe_remote(url: str) -> tuple[str, bool]:
+    """Return (video_id, is_live) for a single video URL, without downloading."""
+    res = _ytdlp("--no-playlist", "--print", "id", "--print", "is_live", url,
+                 timeout=_PROBE_TIMEOUT)
+    if res.returncode != 0 or not res.stdout.strip():
+        raise RuntimeError(f"yt-dlp could not read {url!r}: {res.stderr.strip()[:200]}")
+    lines = res.stdout.strip().splitlines()
+    video_id = lines[0].strip()
+    is_live = len(lines) > 1 and lines[1].strip().lower() == "true"
+    return video_id, is_live
 
 
 def download(url: str, cache_dir: str = "videos") -> str:
     """Download `url` (<=480p) into cache_dir as a canonical mp4 and return the path."""
+    _require_ytdlp()
     os.makedirs(cache_dir, exist_ok=True)
 
-    probe = _ytdlp("--no-playlist", "--print", "id", url)
-    if probe.returncode != 0 or not probe.stdout.strip():
-        raise RuntimeError(f"yt-dlp could not read {url!r}: {probe.stderr.strip()[:200]}")
-    video_id = probe.stdout.strip().splitlines()[0]
+    video_id, is_live = _probe_remote(url)
+    if is_live:
+        raise RuntimeError(
+            f"{url!r} is a live stream; ASCILINE plays finite videos only")
 
     out = os.path.join(cache_dir, f"{video_id}.mp4")
+    # A file at `out` is only ever created by the atomic rename below, so its
+    # mere existence guarantees a complete, already-normalized video.
     if os.path.exists(out):
         print(f"[YT] cached: {out}")
         return out
@@ -100,14 +131,33 @@ def download(url: str, cache_dir: str = "videos") -> str:
            "bv*[vcodec^=avc1][height<=480]+ba/"                # avc1 + any audio
            "b[vcodec^=avc1][height<=480]/"                     # progressive avc1
            "bv*[height<=480]+ba/b[height<=480]/b")             # last resort
-    res = _ytdlp("--no-playlist", "-f", fmt,
-                 "--merge-output-format", "mp4", "-o", out, url)
-    if res.returncode != 0 or not os.path.exists(out):
-        raise RuntimeError(f"yt-dlp download failed: {res.stderr.strip()[-300:]}")
 
-    normalize(out)
+    # Download + normalize into a temp file, then atomically rename. An
+    # interruption (crash, Ctrl-C, full disk) leaves only the temp file, never a
+    # half-written `out` that a later run would mistake for a good cache hit.
+    tmp = out + ".part.mp4"
+    _unlink(tmp)
+    try:
+        res = _ytdlp("--no-playlist", "-f", fmt,
+                     "--merge-output-format", "mp4", "-o", tmp, url)
+        if res.returncode != 0 or not os.path.exists(tmp):
+            raise RuntimeError(f"yt-dlp download failed: {res.stderr.strip()[-300:]}")
+        normalize(tmp)
+        os.replace(tmp, out)        # atomic finalize
+    except BaseException:
+        _unlink(tmp)
+        raise
+
     print(f"[YT] saved: {out}")
     return out
+
+
+def _unlink(path: str) -> None:
+    """Best-effort remove; never raises (used in cleanup paths)."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 # ── format normalization ────────────────────────────────────────────────────
@@ -120,12 +170,17 @@ def _probe(path: str) -> dict:
     the container's nominal rate (r_frame_rate) matches the average, i.e. the
     file is genuinely constant-frame-rate and safe for the engine's timing model.
     """
-    res = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries",
-         "stream=codec_type,codec_name,r_frame_rate,avg_frame_rate",
-         "-of", "json", path],
-        capture_output=True, text=True)
     info = {"vcodec": None, "acodec": None, "fps": None, "cfr": False}
+    if not shutil.which("ffprobe"):
+        return info
+    try:
+        res = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "stream=codec_type,codec_name,r_frame_rate,avg_frame_rate",
+             "-of", "json", path],
+            capture_output=True, text=True, timeout=_PROBE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return info
     if res.returncode != 0:
         return info
     try:
@@ -168,6 +223,10 @@ def normalize(path: str) -> bool:
     plain remux cannot.
     """
     info = _probe(path)
+    if info["vcodec"] is None:
+        # No decodable video stream — nothing ASCILINE can render.
+        what = "audio-only source" if info["acodec"] else "unreadable file"
+        raise RuntimeError(f"{path!r}: no video stream ({what})")
     has_audio = info["acodec"] is not None
     clean = (info["vcodec"] == _OK_VCODEC
              and (not has_audio or info["acodec"] == _OK_ACODEC)
@@ -216,7 +275,13 @@ def _transcode(path: str, fps: float | None, has_audio: bool) -> None:
     else:
         cmd += ["-an"]
     cmd += ["-movflags", "+faststart", "-loglevel", "error", tmp]
-    res = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True,
+                             timeout=_ENCODE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        _unlink(tmp)
+        raise RuntimeError(f"normalize timed out after {_ENCODE_TIMEOUT}s")
     if res.returncode != 0 or not os.path.exists(tmp):
+        _unlink(tmp)
         raise RuntimeError(f"normalize failed: {res.stderr.strip()[-300:]}")
     os.replace(tmp, path)
