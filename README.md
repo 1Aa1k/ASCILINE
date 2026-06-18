@@ -92,6 +92,13 @@ cd ASCILINE
 ```bash
 pip install fastapi uvicorn opencv-python numpy websockets
 ```
+
+**Optional — play from YouTube (and other yt-dlp sites):**
+```bash
+pip install yt-dlp
+```
+Only needed if you pass a URL instead of a local file. Local playback works
+without it. URL playback also uses FFmpeg (see below) to normalize downloads.
 ### 🔈 Audio Support (FFmpeg Required)
 To enable server-side audio processing (Volume 1-5), you must have FFmpeg installed.
 
@@ -111,6 +118,17 @@ If you get a `FileNotFoundError` or don't want to modify system variables:
 ```bash
 python stream_server.py video.mp4 --cols 240
 ```
+
+**YouTube / URL (requires `yt-dlp`):** pass any yt-dlp-supported URL in place of a file.
+```bash
+python stream_server.py "https://youtu.be/VIDEO_ID" --cols 240
+python stream_server.py "https://www.youtube.com/playlist?list=..." --cols 220 --loop
+```
+A single video is downloaded (≤480p — ASCILINE only needs a tiny grid) and cached
+in `videos/` by id, so replays are instant. A playlist/channel URL expands into one
+queue entry per video, each fetched on demand as it plays. Every download is
+normalized to a standard H.264/AAC/constant-frame-rate mp4 so playback and audio
+stay reliable regardless of the source codec.
 
 **Folder mode — drop your videos into `videos/` and run:**
 ```bash
