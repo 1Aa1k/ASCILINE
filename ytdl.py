@@ -1,17 +1,37 @@
 """
-ytdl.py — Resolve YouTube (and other yt-dlp-supported) URLs to a local file.
+ytdl.py — Resolve YouTube (and other yt-dlp-supported) URLs to a local file
+that the ASCILINE engine can ALWAYS open.
 
 ASCILINE downscales every frame to a tiny character grid, so there is no point
-pulling high resolution. We cap at <=480p and mux to a single mp4 with audio
+pulling high resolution. We cap at <=480p and produce a single mp4 with audio
 (the /audio endpoint runs ffmpeg on the same file). Downloads are cached in
 videos/ by video id so re-runs are instant.
+
+Robustness contract (why this file is more than a one-liner):
+  The engine reads frames with OpenCV (cv2.VideoCapture) and extracts audio with
+  ffmpeg. Both break on the files YouTube actually serves:
+    * Best-quality audio is often Opus/WebM. Muxed into mp4 it is a NON-STANDARD
+      file that OpenCV/ffmpeg can choke on -> /audio fails or playback crashes.
+    * Best-quality video is often VP9/AV1, which OpenCV cannot decode without
+      hardware support.
+    * YouTube content is frequently variable-frame-rate (VFR). The engine's whole
+      timing model assumes a single constant FPS (frame_t = 1/fps), so VFR makes
+      cv2's CAP_PROP_FPS unreliable and playback drifts / "the FPS count breaks".
+  So after download we PROBE the file with ffprobe and, unless it is already
+  H.264 + AAC + constant-frame-rate, we normalize it to exactly that. The engine
+  is left untouched: it only ever sees clean, canonical mp4s.
 """
 import os
 import sys
 import json
+import shutil
 import subprocess
 
 _URL_HINTS = ("http://", "https://", "youtube.com", "youtu.be")
+
+# What the engine can open without surprises.
+_OK_VCODEC = "h264"
+_OK_ACODEC = "aac"
 
 
 def is_url(s: str) -> bool:
@@ -58,7 +78,7 @@ def _ytdlp(*args: str) -> subprocess.CompletedProcess:
 
 
 def download(url: str, cache_dir: str = "videos") -> str:
-    """Download `url` (<=480p, muxed mp4) into cache_dir and return the path."""
+    """Download `url` (<=480p) into cache_dir as a canonical mp4 and return the path."""
     os.makedirs(cache_dir, exist_ok=True)
 
     probe = _ytdlp("--no-playlist", "--print", "id", url)
@@ -72,25 +92,103 @@ def download(url: str, cache_dir: str = "videos") -> str:
         return out
 
     print(f"[YT] downloading {url}  (<=480p) ...")
-    # Prefer H.264 (avc1): OpenCV decodes it everywhere, unlike AV1/VP9 which
-    # need hardware support. Fall back to anything <=480p, then re-encode below.
-    fmt = ("bv*[vcodec^=avc1][height<=480]+ba/"
-           "b[vcodec^=avc1][height<=480]/"
-           "bv*[height<=480]+ba/b[height<=480]/b")
+    # Bias the selection toward a clean container in the first place: H.264 video
+    # (avc1) that OpenCV decodes everywhere, paired with AAC audio (mp4a) that is
+    # standard inside mp4. Each fallback widens what we accept; normalize() below
+    # repairs whatever the chosen format could not give us cleanly.
+    fmt = ("bv*[vcodec^=avc1][height<=480]+ba[acodec^=mp4a]/"  # avc1 + aac  -> clean
+           "bv*[vcodec^=avc1][height<=480]+ba/"                # avc1 + any audio
+           "b[vcodec^=avc1][height<=480]/"                     # progressive avc1
+           "bv*[height<=480]+ba/b[height<=480]/b")             # last resort
     res = _ytdlp("--no-playlist", "-f", fmt,
                  "--merge-output-format", "mp4", "-o", out, url)
     if res.returncode != 0 or not os.path.exists(out):
         raise RuntimeError(f"yt-dlp download failed: {res.stderr.strip()[-300:]}")
 
-    if not _decodable(out):
-        print("[YT] codec not decodable (likely AV1/VP9) — re-encoding to H.264 ...")
-        _reencode_h264(out)
+    normalize(out)
     print(f"[YT] saved: {out}")
     return out
 
 
+# ── format normalization ────────────────────────────────────────────────────
+
+def _probe(path: str) -> dict:
+    """
+    Return {'vcodec','acodec','fps','cfr'} via ffprobe.
+
+    fps is the *average* real frame rate (avg_frame_rate); cfr is True only when
+    the container's nominal rate (r_frame_rate) matches the average, i.e. the
+    file is genuinely constant-frame-rate and safe for the engine's timing model.
+    """
+    res = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries",
+         "stream=codec_type,codec_name,r_frame_rate,avg_frame_rate",
+         "-of", "json", path],
+        capture_output=True, text=True)
+    info = {"vcodec": None, "acodec": None, "fps": None, "cfr": False}
+    if res.returncode != 0:
+        return info
+    try:
+        streams = json.loads(res.stdout).get("streams", [])
+    except json.JSONDecodeError:
+        return info
+    for st in streams:
+        if st.get("codec_type") == "video" and info["vcodec"] is None:
+            info["vcodec"] = st.get("codec_name")
+            r_fps = _ratio(st.get("r_frame_rate"))
+            a_fps = _ratio(st.get("avg_frame_rate"))
+            info["fps"] = a_fps or r_fps
+            # CFR when both rates are known and agree within rounding.
+            info["cfr"] = bool(r_fps and a_fps and abs(r_fps - a_fps) < 0.01)
+        elif st.get("codec_type") == "audio" and info["acodec"] is None:
+            info["acodec"] = st.get("codec_name")
+    return info
+
+
+def _ratio(s: str | None) -> float | None:
+    """Parse ffprobe rationals like '30000/1001' -> 29.97; '0/0' -> None."""
+    if not s or "/" not in s:
+        return None
+    num, den = s.split("/", 1)
+    try:
+        num_f, den_f = float(num), float(den)
+    except ValueError:
+        return None
+    return num_f / den_f if den_f else None
+
+
+def normalize(path: str) -> bool:
+    """
+    Ensure `path` is a canonical mp4 the engine can always open:
+    H.264 video + AAC audio (or no audio) at a constant frame rate.
+
+    Fast path: if the file already satisfies the contract, do nothing and return
+    False. Otherwise transcode in place and return True. Re-encoding is the only
+    reliable way to repair VP9/AV1 video, Opus-in-mp4 audio, and VFR timing — a
+    plain remux cannot.
+    """
+    info = _probe(path)
+    has_audio = info["acodec"] is not None
+    clean = (info["vcodec"] == _OK_VCODEC
+             and (not has_audio or info["acodec"] == _OK_ACODEC)
+             and info["cfr"])
+    if clean and _decodable(path):
+        return False
+
+    reason = []
+    if info["vcodec"] != _OK_VCODEC:
+        reason.append(f"video={info['vcodec']}")
+    if has_audio and info["acodec"] != _OK_ACODEC:
+        reason.append(f"audio={info['acodec']}")
+    if not info["cfr"]:
+        reason.append("vfr")
+    print(f"[YT] normalizing ({', '.join(reason) or 'unreadable'}) -> H.264/AAC/CFR ...")
+    _transcode(path, fps=info["fps"], has_audio=has_audio)
+    return True
+
+
 def _decodable(path: str) -> bool:
-    """True if OpenCV can actually read the first frame."""
+    """True if OpenCV can actually read the first frame (last-ditch sanity check)."""
     try:
         import cv2
     except ImportError:
@@ -101,13 +199,24 @@ def _decodable(path: str) -> bool:
     return ok
 
 
-def _reencode_h264(path: str) -> None:
-    """Transcode in place to H.264 + AAC so OpenCV/ffmpeg can read it."""
-    tmp = path + ".h264.mp4"
-    res = subprocess.run(
-        ["ffmpeg", "-y", "-i", path, "-c:v", "libx264", "-preset", "veryfast",
-         "-crf", "23", "-c:a", "aac", "-b:a", "128k", "-loglevel", "error", tmp],
-        capture_output=True, text=True)
+def _transcode(path: str, fps: float | None, has_audio: bool) -> None:
+    """Transcode in place to H.264 + AAC at a constant frame rate."""
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError("ffmpeg not found; cannot normalize downloaded video")
+    tmp = path + ".norm.mp4"
+    # -fps_mode cfr + an explicit -r force a constant frame rate so the engine's
+    # 1/fps timing stays in sync; yuv420p keeps OpenCV/browsers happy.
+    rate = f"{fps:.6f}" if fps and fps > 0 else "30"
+    cmd = ["ffmpeg", "-y", "-i", path,
+           "-map", "0:v:0",
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+           "-pix_fmt", "yuv420p", "-r", rate, "-fps_mode", "cfr"]
+    if has_audio:
+        cmd += ["-map", "0:a:0", "-c:a", "aac", "-b:a", "128k"]
+    else:
+        cmd += ["-an"]
+    cmd += ["-movflags", "+faststart", "-loglevel", "error", tmp]
+    res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode != 0 or not os.path.exists(tmp):
-        raise RuntimeError(f"re-encode failed: {res.stderr.strip()[-300:]}")
+        raise RuntimeError(f"normalize failed: {res.stderr.strip()[-300:]}")
     os.replace(tmp, path)
