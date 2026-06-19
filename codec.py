@@ -37,9 +37,12 @@ TAG_DELTA = 2
 DEFAULT_LEVEL = 3        # zlib level: best size/CPU trade-off (see experiments/optimize.py)
 KEYFRAME_INTERVAL = 48   # force a full frame this often for resync / late joiners
 
-# Smart-selection thresholds (fraction of cells changed).
-_DELTA_MAX_FRAC = 0.60   # above this, delta loses — don't bother building it
-_ZLIB_MIN_FRAC = 0.10    # below this, full-frame zlib loses — don't bother
+# Smart-selection thresholds.
+_DELTA_MAX_FRAC = 0.60   # above this fraction of changed cells, delta loses — skip it
+# When a delta exists, only also compress the full frame if the delta didn't
+# clearly win, i.e. it compressed to more than this fraction of the raw frame.
+# Below it, the full-frame zlib cannot win and computing it just burns CPU.
+_FULL_FRAME_WORTH_FRAC = 0.5
 
 
 def _full_frame(raw: bytes, frame_index: int, level: int) -> bytes:
@@ -94,7 +97,13 @@ def encode_frame(frame: np.ndarray, prev: np.ndarray | None, frame_index: int,
         vals = frame.reshape(-1, C)[ci]
         delta = zlib.compress(ci.tobytes() + vals.tobytes(), level)
         candidates.append((TAG_DELTA, delta, delta_shown))
-    if frac >= _ZLIB_MIN_FRAC or not candidates:
+    # Only spend a second zlib pass on the full frame when it can actually win:
+    # if there's no delta, or the delta didn't clearly beat the raw frame. When
+    # the delta is already small the full-frame zlib can't be smaller, so
+    # computing it just burns CPU — that wasted pass is what dropped FPS and
+    # stuttered under lossy --quality presets (#25). Output is unchanged: the
+    # full frame is only skipped in cases where min() would never have picked it.
+    if not candidates or len(candidates[0][1]) > _FULL_FRAME_WORTH_FRAC * len(raw):
         candidates.append((TAG_ZLIB, zlib.compress(raw, level), frame))
 
     tag, payload, shown = min(candidates, key=lambda c: len(c[1]))
