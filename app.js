@@ -206,6 +206,7 @@ function connectWebSocket() {
                 if (seekPlayed) seekPlayed.style.transform = 'scaleX(0)';
 
                 audioOffset = 0;
+                scrubMeta = null; // reset so new video gets fresh thumbnails
                 // Lazy-load hover thumbnails: only fetch on first hover
                 const qIdx = currentQueueIdx;
                 if (seekWrap && !scrubMeta) {
@@ -558,7 +559,7 @@ function skip(delta) {
 function setupScrub(v) {
     scrubMeta = null;
     if (seekPreviewImg) seekPreviewImg.style.backgroundImage = '';
-    fetch('/scrub?v=' + (v || 0)).then(r => r.json()).then(m => {
+    fetch('/scrub?v=' + (v || 0) + '&t=' + Date.now()).then(r => r.json()).then(m => {
         if (!m || !m.available || !seekPreviewImg) return;
         scrubMeta = m;
         seekPreviewImg.style.width = m.cellW + 'px';

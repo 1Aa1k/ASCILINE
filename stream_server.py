@@ -42,17 +42,29 @@ def get_video_dimensions(path: str) -> tuple[int, int]:
     return w, h
 
 
-def calc_auto_rows(cols: int, vid_w: int, vid_h: int, pixel_mode: bool) -> int:
+def calc_auto_dimensions(cols: int, vid_w: int, vid_h: int, pixel_mode: bool) -> tuple[int, int]:
     """
-    Calculate rows from video aspect ratio.
+    Calculate (cols, rows) from video aspect ratio.
     ASCII mode: characters are ~2x taller than wide, so divide by 2.
     Pixel mode: cells are square (CSS stretches), no correction needed.
     """
+    # Pixel mode uses GPU-accelerated fillRect → generous cap
+    # ASCII mode uses CPU fillText per cell → tight cap to prevent stutter on vertical videos
+    MAX_ROWS = 350 if pixel_mode else 100
     ratio = vid_w / max(vid_h, 1)
+    
     if pixel_mode:
-        return max(1, round(cols / ratio))
+        rows = max(1, round(cols / ratio))
     else:
-        return max(1, round(cols / ratio / 2))
+        rows = max(1, round(cols / ratio / 2))
+        
+    if rows > MAX_ROWS:
+        # Scale down BOTH cols and rows to preserve aspect ratio
+        scale = MAX_ROWS / rows
+        rows = MAX_ROWS
+        cols = max(1, round(cols * scale))
+        
+    return cols, rows
 
 # Serve only whitelisted static files (security: prevents directory traversal)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -350,7 +362,8 @@ async def scrub_meta(v: int | None = None):
     if not built:
         return Response(content='{"available": false}', media_type="application/json")
     meta = dict(built["meta"])
-    meta["sprite"] = f"/scrub_sprite?v={v if v is not None else 0}"
+    vid_id = os.path.basename(video_path)
+    meta["sprite"] = f"/scrub_sprite?v={v if v is not None else 0}&id={vid_id}"
     return Response(content=_json.dumps(meta), media_type="application/json")
 
 
@@ -461,7 +474,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
 
             if rows_cfg == 0:
-                rows = calc_auto_rows(cols, vid_w, vid_h, pixel_mode)
+                cols, rows = calc_auto_dimensions(cols, vid_w, vid_h, pixel_mode)
                 print(f"[AUTO] {vid_w}x{vid_h} → grid {cols}x{rows}")
             else:
                 rows = rows_cfg
@@ -860,6 +873,8 @@ if __name__ == "__main__":
     # ── High FPS Warning ──
     high_fps_videos = []
     for entry in queue:
+        if ytdl.is_url(entry['video']):
+            continue  # skip remote URLs; yt-dlp normalizes to 30 FPS
         cap = cv2.VideoCapture(entry['video'])
         if cap.isOpened():
             fps = cap.get(cv2.CAP_PROP_FPS)
@@ -893,9 +908,12 @@ if __name__ == "__main__":
     print(f" \033[32m▶\033[0m \033[1mResolution\033[0m: {res_str}")
     print(f" \033[32m▶\033[0m \033[1mDefault\033[0m   : mode={args.mode} | pixel={'ON' if args.pixel else 'OFF'} | vol={args.vol}")
     print(f"\033[1;37m{'─'*55}\033[0m")
-    for i, entry in enumerate(queue, 1):
+    MAX_DISPLAY = 10
+    for i, entry in enumerate(queue[:MAX_DISPLAY], 1):
         px = ' \033[35m[PIXEL]\033[0m' if entry.get('pixel') else ''
         print(f"  {i:2}. \033[36m{entry['video']}\033[0m  (mode={entry['mode']}{px} vol={entry['vol']})")
+    if len(queue) > MAX_DISPLAY:
+        print(f"  \033[90m... and {len(queue) - MAX_DISPLAY} more\033[0m")
     print(f"\033[1;37m{'═'*55}\033[0m\n")
     print(f" \033[1;32m🚀 Server live →\033[0m \033[4;36mhttp://localhost:{args.port}\033[0m\n")
 

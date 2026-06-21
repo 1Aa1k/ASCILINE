@@ -73,7 +73,7 @@ def test_normalize_rejects_audio_only(tmp_path):
     audio = tmp_path / "audio_only.mp4"
     r = subprocess.run(
         ["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
-         "-c:a", "aac", "-loglevel", "error", str(audio)],
+         "-c:a", "aac", "-strict", "-2", "-loglevel", "error", str(audio)],
         capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     with pytest.raises(RuntimeError, match="no video stream"):
