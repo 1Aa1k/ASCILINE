@@ -42,6 +42,12 @@ let state = 'IDLE'; // IDLE | PLAYING | PAUSED
 let ws = null;
 let bufferReportTimer = null; // periodic backlog report to the server (backpressure)
 const frameBuffer = [];
+// Highest frame index we've actually RECEIVED off the wire. Reported to the
+// server (ack pacing) so it can pace sending to real delivery when the network
+// is the bottleneck — the client's decode-buffer depth stays 0 in that case and
+// can't reveal it. WebSocket preserves order, so "last received" == highest;
+// after a seek it simply follows the new (lower) indices down. -1 = none yet.
+let lastReceivedIndex = -1;
 const BUFFER_SIZE = 4;
 let codecDecoder = null; // Adaptive codec decoder (codec.js)
 let targetFps = 24;
@@ -270,11 +276,15 @@ function connectWebSocket() {
             const text = event.data;
             const newlineIdx = text.indexOf('\n');
             const frameIndex = parseInt(text.substring(0, newlineIdx));
+            lastReceivedIndex = frameIndex;
             const frameTime = frameIndex / targetFps;
             const frameData = text.substring(newlineIdx + 1);
             frameBuffer.push({ data: frameData, time: frameTime });
         } else {
-            // Binary Frames — decoded via adaptive codec (raw/zlib/delta)
+            // Binary Frames — decoded via adaptive codec (raw/zlib/delta).
+            // The 4-byte big-endian header is the frame index even under the
+            // adaptive codec, so we can ack receipt now, before the async decode.
+            lastReceivedIndex = new DataView(event.data).getUint32(0, false);
             if (codecDecoder) {
                 framesInFlight++;
                 codecDecoder.decode(event.data).then(({ frameIndex, frame }) => {
@@ -345,14 +355,14 @@ function renderFrame(now) {
         }
     }
 
-    if (frameBuffer.length === 0) return;
+    if (frameBuffer.length === 0) { maybeBuffer(masterClock); return; }
 
     // A/V Sync: Drop frames that are too far behind the master clock (catch up)
     while (frameBuffer.length > 0 && frameBuffer[0].time < masterClock - 0.1) {
         frameBuffer.shift();
     }
-    
-    if (frameBuffer.length === 0) return;
+
+    if (frameBuffer.length === 0) { maybeBuffer(masterClock); return; }
 
     // A/V Sync: Wait if the frame is in the future
     if (frameBuffer[0].time > masterClock + 0.05) {
@@ -425,20 +435,73 @@ function renderFrame(now) {
 }
 
 // ═══════════════════════════════════════
+//  AUTO-PAUSE BUFFERING (network underrun)
+// ═══════════════════════════════════════
+// On a slow *network* the server paces sending (it never drops scenes from a
+// finite video), so the decode buffer can run dry. We must not let the audio
+// master clock keep advancing past the video we actually have — that desyncs
+// A/V and makes the late frames arrive "stale" (time < masterClock - 0.1) and
+// get discarded. So on underrun we freeze the clock (pause audio) and resume
+// only once the buffer has refilled — YouTube-style rebuffering. A *CPU*
+// underrun is handled server-side by frame-dropping instead, so this path only
+// fires when frames simply haven't arrived over the wire yet.
+const BUFFER_RESUME = 8;   // frames buffered before we resume after an underrun
+let bufferStartTime = 0;
+
+function maybeBuffer(masterClock) {
+    if (state !== 'PLAYING') return;
+    // Don't mistake the natural end of the video for a network underrun.
+    if (duration && masterClock >= duration - 1) return;
+    state = 'BUFFERING';
+    bufferStartTime = performance.now();
+    if (audioEl && !audioEl.paused) audioEl.pause();
+    if (statusEl) { statusEl.textContent = '⟳ Buffering…'; statusEl.style.color = '#888'; }
+    requestAnimationFrame(bufferingPoll);
+}
+
+function bufferingPoll() {
+    if (state !== 'BUFFERING') return;           // user paused, seeked, or stream ended
+    if (!ws || ws.readyState !== WebSocket.OPEN) { finishStream(); return; }
+    if (frameBuffer.length >= BUFFER_RESUME) {
+        // Frozen wall time must be credited back so the wall clock (no-audio
+        // branch) doesn't think it's behind and burst. The audio branch needs no
+        // adjustment: a paused <audio> element holds currentTime on its own.
+        streamStartTime += performance.now() - bufferStartTime;
+        bufferStartTime = 0;
+        state = 'PLAYING';
+        if (audioEl && audioEl.paused) audioEl.play().catch(() => {});
+        if (statusEl) statusEl.style.color = 'var(--accent-color)';
+        lastRenderTime = performance.now();
+        requestAnimationFrame(renderFrame);
+        return;
+    }
+    requestAnimationFrame(bufferingPoll);
+}
+
+// ═══════════════════════════════════════
 //  CLEANUP
 // ═══════════════════════════════════════
 
 // ── BACKPRESSURE REPORTING ──
-// Tell the server how many frames are currently stuck in the decode pipeline
-// (framesInFlight). When it grows, the client is CPU-bound, and the server 
-// drops frames instead of making us inflate+delta-patch them.
+// Two independent signals, because the client can fall behind for two unrelated
+// reasons and only the client can see them:
+//   depth = framesInFlight — frames stuck in the decode pipeline. Grows when the
+//           client is CPU-bound; the server drops frames instead of making us
+//           inflate+delta-patch frames we'd only discard. (Note: read-ahead in
+//           frameBuffer is healthy and deliberately NOT counted, to avoid
+//           false-positive drops on fast networks.)
+//   recv  = lastReceivedIndex — highest frame index actually received off the
+//           wire. Lets the server detect a *network* bottleneck (sent >> acked)
+//           that depth can't, since choked frames never reach the decoder.
 let framesInFlight = 0;
 
 function startBufferReports() {
     stopBufferReports();
     bufferReportTimer = setInterval(() => {
-        if (ws && ws.readyState === WebSocket.OPEN && state === 'PLAYING') {
-            ws.send(JSON.stringify({ type: 'buffer', depth: framesInFlight }));
+        // Keep reporting while BUFFERING too: acks (recv) must keep flowing or the
+        // server's ack-pacing would wait forever for frames we're trying to buffer.
+        if (ws && ws.readyState === WebSocket.OPEN && (state === 'PLAYING' || state === 'BUFFERING')) {
+            ws.send(JSON.stringify({ type: 'buffer', depth: framesInFlight, recv: lastReceivedIndex }));
         }
     }, 250);
 }
@@ -470,6 +533,12 @@ function finishStream() {
 // ═══════════════════════════════════════
 
 function togglePause() {
+    if (state === 'BUFFERING') {
+        // Fold the in-progress stall into the wall clock, then pause as if playing
+        // (audio is already paused, bufferingPoll exits once state changes).
+        if (bufferStartTime) { streamStartTime += performance.now() - bufferStartTime; bufferStartTime = 0; }
+        state = 'PLAYING';
+    }
     if (state === 'PLAYING') {
         state = 'PAUSED';
         pauseStartTime = performance.now();
@@ -545,7 +614,9 @@ function doSeek(targetSec) {
         audioEl.src = `/audio?v=${currentQueueIdx}&start=${targetSec}&t=${Date.now()}`;
         audioEl.load();
 
-        if (state === 'PLAYING') {
+        if (state === 'PLAYING' || state === 'BUFFERING') {
+            state = 'PLAYING';   // a seek supersedes an in-progress buffering stall
+            bufferStartTime = 0;
             readyToRender = false;
             audioEl.play().catch(() => {});
             const onAudioStart = () => {
@@ -577,7 +648,7 @@ function getMasterClock() {
 }
 
 function skip(delta) {
-    if (state !== 'PLAYING' && state !== 'PAUSED') return;
+    if (state !== 'PLAYING' && state !== 'PAUSED' && state !== 'BUFFERING') return;
     if (!duration) return;
     doSeek(getMasterClock() + delta);
 }

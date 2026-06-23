@@ -678,6 +678,18 @@ async def websocket_endpoint(websocket: WebSocket):
             client_backlog = 0   # latest depth reported by the client (0 = unknown/healthy)
             consec_drops = 0
 
+            # ── TRANSPORT-SIDE BACKPRESSURE (ack pacing) ──
+            # client_backlog (framesInFlight) only sees the client's *CPU*
+            # bottleneck. A *network* bottleneck is invisible locally — uvicorn does
+            # not back-pressure the ASGI send, so send_bytes returns immediately. The
+            # client therefore also reports the highest frame index it has *received*
+            # ("recv"); we keep at most INFLIGHT_HIGH frames sent-but-unacked. The two
+            # bottlenecks get opposite treatment in the loop below (pace vs drop).
+            INFLIGHT_HIGH = BACKLOG_HIGH
+            last_recv_index = -1       # highest frame index the client has acked (-1 = none)
+            last_sent_index = -1       # highest frame index we have actually sent
+            was_network_paced = False  # true while we're holding for acks to catch up
+
             _loop = asyncio.get_event_loop()
 
             try:
@@ -698,23 +710,61 @@ async def websocket_endpoint(websocket: WebSocket):
                             bw_start_time = time.time()
                             client_backlog = 0  # stale across a seek
                             consec_drops = 0
+                            last_recv_index = -1  # acks for old indices are stale
+                            last_sent_index = -1
+                            was_network_paced = False
                         elif msg.get("type") == "buffer":
                             # Client's current decoded-frame backlog (frameBuffer.length).
                             try:
                                 client_backlog = max(0, int(msg.get("depth", 0)))
                             except (TypeError, ValueError):
                                 client_backlog = 0
+                            # Highest frame index the client has actually received.
+                            # Optional/back-compat: older clients omit it.
+                            if "recv" in msg:
+                                try:
+                                    last_recv_index = int(msg["recv"])
+                                except (TypeError, ValueError):
+                                    pass
 
                     if is_paused:
                         await asyncio.sleep(0.1)
                         continue
 
-                    # ── BACKPRESSURE ──
-                    # If the client is behind, skip this frame instead of sending one
-                    # it will only decode-then-drop. Advancing the source keeps video
-                    # time-aligned with the audio/wall clock; prev_frame is held so the
-                    # next sent frame is a correct delta across the gap. MAX_CONSEC_DROPS
-                    # caps the gap and guarantees we never starve the client.
+                    # ── NETWORK BACKPRESSURE: pace, never drop ──
+                    # ASCILINE plays finite videos only (ytdl rejects live URLs), so a
+                    # slow *network* must not cost scenes. Instead of dropping, stop
+                    # producing and let the wire drain until the client's acks catch
+                    # up. Bounding in-flight (sent - acked) caps the bytes queued ahead
+                    # of the keep-alive ping — that pile-up is what reset the socket on
+                    # a slow link (WinError 10054), and the drop path couldn't see it
+                    # because choked frames never reach the client's decode buffer and
+                    # so never show up as client_backlog. The client freezes its master
+                    # clock (auto-pause buffering) while we're paced, so audio never
+                    # runs past the video we've delivered. last_recv < 0 = no ack yet →
+                    # don't pace (the startup burst fills the client's jitter buffer).
+                    # NOTE: when live-source support lands, live should DROP here
+                    # instead (you can't buffer your way back to the real-time edge).
+                    network_behind = (last_recv_index >= 0 and
+                                      last_sent_index - last_recv_index > INFLIGHT_HIGH)
+                    if network_behind:
+                        was_network_paced = True
+                        await asyncio.sleep(frame_t)
+                        continue
+                    if was_network_paced:
+                        # Acks caught up: rebase the wall clock so we resume at natural
+                        # cadence instead of bursting to reclaim the time spent paced.
+                        was_network_paced = False
+                        start_time = _loop.time() - (frame_index * frame_t)
+
+                    # ── CPU BACKPRESSURE: drop ──
+                    # The client's decode pipeline (framesInFlight) is the bottleneck.
+                    # Waiting can't clear a CPU deficit, so skip this frame instead of
+                    # sending one it would only decode-then-drop. Advancing the source
+                    # keeps video time-aligned with the audio/wall clock; prev_frame is
+                    # held so the next sent frame is a correct delta across the gap.
+                    # MAX_CONSEC_DROPS caps the gap and guarantees we never starve the
+                    # client.
                     if client_backlog > BACKLOG_HIGH and consec_drops < MAX_CONSEC_DROPS:
                         advanced = await _loop.run_in_executor(None, advance_one)
                         if not advanced:
@@ -742,6 +792,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         await websocket.send_text(data)
                     else:
                         await websocket.send_bytes(data)
+                    last_sent_index = frame_index  # for ack-paced backpressure
 
                     bw_bytes_sent += wire_size
                     bw_raw_bytes += raw_size
