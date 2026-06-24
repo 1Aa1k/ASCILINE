@@ -503,8 +503,8 @@ async def websocket_endpoint(websocket: WebSocket):
 
             render_mode= entry["mode"]
             pixel_mode = entry.get("pixel", False)
-            if render_mode == 1: #extra security layer for mod-1 in json
-              pixel_mode = False
+            if render_mode == 1: #extra security layer for mod-1 in json (its fixes json override mechanism problem )
+                pixel_mode = False
             cols       = entry.get("cols", 200)
             rows_cfg   = entry.get("rows", 0)
 
