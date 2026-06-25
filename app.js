@@ -253,7 +253,7 @@ function connectWebSocket() {
                     audioEl.src = `/audio${qs}t=${Date.now()}`;
                     audioEl.volume = volumeSlider ? volumeSlider.value : 1.0;
                     audioEl.load();
-                    audioEl.play().catch(() => {});
+                    safePlay();
 
                     // Wait for audio to actually start playing
                     if (audioEl.readyState >= 3) {
@@ -445,8 +445,40 @@ function renderFrame(now) {
 // only once the buffer has refilled — YouTube-style rebuffering. A *CPU*
 // underrun is handled server-side by frame-dropping instead, so this path only
 // fires when frames simply haven't arrived over the wire yet.
-const BUFFER_RESUME = 8;   // frames buffered before we resume after an underrun
+const BUFFER_RESUME = 8;    // healthy buffer depth that resumes immediately
+const MIN_RESUME = 1;       // minimum frames we'll resume with after a long wait
+const MAX_BUFFER_WAIT = 1500; // ms — past this we resume with whatever we have
 let bufferStartTime = 0;
+// Invalidates in-flight bufferingPoll loops. Every entry into buffering bumps
+// this and captures it; a poll whose token is stale (e.g. a seek arrived mid
+// buffer) bails instead of racing a second resume / render loop.
+let bufferGen = 0;
+
+// ── SAFE AUDIO PLAY / PAUSE ──
+// HTMLMediaElement.play() returns a promise that REJECTS with a DOMException if
+// the element is paused before play() settles. That happens here whenever a
+// play() (seek / startup / resume) is followed immediately by a buffering
+// underrun that calls pause() on a still-empty frame buffer — it permanently
+// wedges the browser's audio state (A/V desync that never recovers). Serializing
+// pause() behind the pending play() promise makes the pair race-free.
+let audioPlayPromise = null;
+function safePlay() {
+    if (!audioEl) return;
+    audioPlayPromise = audioEl.play();
+    if (audioPlayPromise && audioPlayPromise.catch) {
+        audioPlayPromise.catch(() => {}).finally(() => { audioPlayPromise = null; });
+    }
+}
+function safePause() {
+    if (!audioEl) return;
+    if (audioPlayPromise && audioPlayPromise.then) {
+        // play() hasn't settled yet — wait for it, then pause, so we never
+        // interrupt it mid-flight.
+        audioPlayPromise.then(() => audioEl.pause()).catch(() => {});
+    } else {
+        audioEl.pause();
+    }
+}
 
 function maybeBuffer(masterClock) {
     if (state !== 'PLAYING') return;
@@ -454,28 +486,36 @@ function maybeBuffer(masterClock) {
     if (duration && masterClock >= duration - 1) return;
     state = 'BUFFERING';
     bufferStartTime = performance.now();
-    if (audioEl && !audioEl.paused) audioEl.pause();
+    if (audioEl && !audioEl.paused) safePause();
     if (statusEl) { statusEl.textContent = '⟳ Buffering…'; statusEl.style.color = '#888'; }
-    requestAnimationFrame(bufferingPoll);
+    const gen = ++bufferGen;
+    requestAnimationFrame(() => bufferingPoll(gen));
 }
 
-function bufferingPoll() {
+function bufferingPoll(gen) {
+    if (gen !== bufferGen) return;               // superseded by a newer seek/buffer
     if (state !== 'BUFFERING') return;           // user paused, seeked, or stream ended
     if (!ws || ws.readyState !== WebSocket.OPEN) { finishStream(); return; }
-    if (frameBuffer.length >= BUFFER_RESUME) {
+    // Resume on a healthy buffer, OR — to avoid a permanent stall on a slow link
+    // where BUFFER_RESUME frames may never stack up (initial 3G start, paced
+    // delivery) — once we've waited long enough and have at least one frame to
+    // show. Without this fallback the strict >= BUFFER_RESUME gate deadlocks.
+    const waited = performance.now() - bufferStartTime;
+    if (frameBuffer.length >= BUFFER_RESUME ||
+        (frameBuffer.length >= MIN_RESUME && waited >= MAX_BUFFER_WAIT)) {
         // Frozen wall time must be credited back so the wall clock (no-audio
         // branch) doesn't think it's behind and burst. The audio branch needs no
         // adjustment: a paused <audio> element holds currentTime on its own.
         streamStartTime += performance.now() - bufferStartTime;
         bufferStartTime = 0;
         state = 'PLAYING';
-        if (audioEl && audioEl.paused) audioEl.play().catch(() => {});
+        if (audioEl && audioEl.paused) safePlay();
         if (statusEl) statusEl.style.color = 'var(--accent-color)';
         lastRenderTime = performance.now();
         requestAnimationFrame(renderFrame);
         return;
     }
-    requestAnimationFrame(bufferingPoll);
+    requestAnimationFrame(() => bufferingPoll(gen));
 }
 
 // ═══════════════════════════════════════
@@ -537,6 +577,7 @@ function togglePause() {
         // Fold the in-progress stall into the wall clock, then pause as if playing
         // (audio is already paused, bufferingPoll exits once state changes).
         if (bufferStartTime) { streamStartTime += performance.now() - bufferStartTime; bufferStartTime = 0; }
+        bufferGen++;   // kill the in-flight buffering loop
         state = 'PLAYING';
     }
     if (state === 'PLAYING') {
@@ -544,7 +585,7 @@ function togglePause() {
         pauseStartTime = performance.now();
         
         if (audioEl && !audioEl.paused) {
-            audioEl.pause();
+            safePause();
         }
         if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: 'pause', paused: true }));
@@ -567,7 +608,7 @@ function togglePause() {
         
         // Restore audio playback
         if (audioEl && audioEl.paused) {
-            audioEl.play().catch(() => {});
+            safePlay();
         }
 
         // Flush stale buffer frames — A/V sync catch-up handles the rest
@@ -605,39 +646,40 @@ function doSeek(targetSec) {
         ws.send(JSON.stringify({ type: 'seek', time: targetSec }));
     }
 
-    // Drop stale frames, then restart audio from the seek point
+    // Drop stale frames, then reload audio from the seek point.
     frameBuffer.length = 0;
     audioOffset = targetSec;
 
+    const wasActive = (state === 'PLAYING' || state === 'BUFFERING');
+
     if (audioEl) {
+        // Reload the audio element from the new position but DON'T play yet.
         audioEl.pause();
         audioEl.src = `/audio?v=${currentQueueIdx}&start=${targetSec}&t=${Date.now()}`;
         audioEl.load();
+    }
 
-        if (state === 'PLAYING' || state === 'BUFFERING') {
-            state = 'PLAYING';   // a seek supersedes an in-progress buffering stall
-            bufferStartTime = 0;
-            readyToRender = false;
-            audioEl.play().catch(() => {});
-            const onAudioStart = () => {
-                if (!readyToRender) {
-                    readyToRender = true;
-                    streamStartTime = performance.now() - (targetSec * 1000.0);
-                    lastRenderTime = performance.now();
-                    lastFpsUpdate = performance.now();
-                    frameCount = 0;
-                    requestAnimationFrame(renderFrame);
-                }
-            };
-            if (audioEl.readyState >= 3) onAudioStart();
-            else {
-                audioEl.addEventListener('playing', onAudioStart, { once: true });
-                setTimeout(onAudioStart, 500);
-            }
-        } else {
-            streamStartTime = performance.now() - (targetSec * 1000.0);
-        }
+    if (wasActive) {
+        // The buffer is now empty. If we fired audioEl.play() here, the very next
+        // renderFrame would underrun and call maybeBuffer() → pause(), interrupting
+        // the pending play() promise (DOMException) and desyncing A/V. Instead we
+        // enter BUFFERING and let bufferingPoll start audio + rendering only once
+        // frames for the new position have actually arrived.
+        readyToRender = true;
+        bufferStartTime = performance.now();
+        // Encode the seek target into streamStartTime so bufferingPoll's
+        // "+= now - bufferStartTime" credit lands the wall clock exactly at
+        // targetSec on resume. (Audio branch is covered by audioOffset.)
+        streamStartTime = bufferStartTime - (targetSec * 1000.0);
+        lastRenderTime = bufferStartTime;
+        lastFpsUpdate = bufferStartTime;
+        frameCount = 0;
+        state = 'BUFFERING';
+        if (statusEl) { statusEl.textContent = '⟳ Buffering…'; statusEl.style.color = '#888'; }
+        const gen = ++bufferGen;
+        requestAnimationFrame(() => bufferingPoll(gen));
     } else {
+        // Paused / idle: just reposition the clock; playback stays where it was.
         streamStartTime = performance.now() - (targetSec * 1000.0);
     }
 }
